@@ -94,6 +94,7 @@ class Rule(object):
         tailvals = [x.val for x in self.tail]
         a = self.head.val
         b = self.onefalse(tailvals)
+        # alternative: 1 - (1 - a) * np.prod(tailvals)
         return a + (1. - a) * b
 
     @classmethod
@@ -219,7 +220,17 @@ class Cortex(object):
         """
         eher so:
         X, Y, XY, YX, XX, YY, XZ, ZX, YZ, ZY - > XY
+        oder so:
+        X -> X
+        X, Y -> XY
+        X, Y -> YX
         nicht so:
+        """
+        self.nets = [
+            Net("X -> X", self),
+            Net("X, Y -> XY", self),
+            Net("X, Y -> YX", self)
+        ]
         """
         self.nets = [
             Net("X -> X", self),
@@ -236,6 +247,7 @@ class Cortex(object):
             Net("XY -> YZ", self),
             Net("XY -> ZX", self),
             Net("XY -> ZY", self)]
+        """
 
     def add_function(self, function):
         if function.name in self.names:
