@@ -7,6 +7,14 @@ from theano import function
 from theano import pp
 
 
+class SquaredLoss(object):
+    def __init__(self):
+        self.goal = T.dvector('y')
+
+    def loss(self, prediction):
+        return ((self.goal - prediction) ** 2).mean()
+
+
 class Net(object):
     i = 0
 
@@ -21,6 +29,15 @@ class Net(object):
         new_net.add_net(self.clone())
         new_net.add_net(other.clone())
         return new_net
+
+    @property
+    def compiled(self):
+        try:
+            return self._compiled
+        except AttributeError:
+            self._compiled = function([self.input], self.output)
+            return self._compiled
+
 
 
 class SuperNet(Net):
@@ -43,10 +60,23 @@ class SuperNet(Net):
 
     def clone(self):
         clone = SuperNet()
-        if self.layers:
-            clone.layers = [layer.clone() for layer in self.layers]
-            clone.connect_layers()
+        originals = self.traverse([self.root], [])
+        clones = dict((original, original.clone()) for original in originals)
+        for original in clones:
+            for child in original.children:
+                clones[original].link(clones[child])
+        clone.root = clones[self.root]
+        clone.leaf = clones[self.leaf]
         return clone
+
+    @staticmethod
+    def traverse(candidates, result):
+        if candidates:
+            if candidates[0] not in result:
+                result.append(candidates[0])
+            return SuperNet.traverse(candidates[1:] + candidates[0].children, result)
+        else:
+            return result
 
     def connect_layers(self):
         last = self.layers[0]
@@ -81,13 +111,13 @@ class SuperNet(Net):
     def n_out(self):
         return self.layers[-1].n_out
 
-    @property
-    def compiled(self):
-        try:
-            return self._compiled
-        except AttributeError:
-            self._compiled = function([self.input], self.output)
-            return self._compiled
+    def add_loss_function(self, loss_function):
+        self.loss_function = loss_function.loss(self.output)
+        updates = []
+        for layer in self.layers:
+            gw, gb = T.grad(self.loss_function, [layer.w, layer.b])
+            updates += [(layer.w, layer.w - layer.w * gw * 0.01), (layer.b, layer.b - gb * 0.01)]
+        self.train = function([self.input, loss_function.goal], self.loss_function, updates=updates)
 
 
 class Layer(Net):
@@ -95,6 +125,8 @@ class Layer(Net):
         Net.__init__(self)
         self.n_in = n_in
         self.n_out = n_out
+        self.parents = []
+        self.children = []
         if w is None:
             self.w = theano.shared(np.random.randn(n_in, n_out), name='w[%i]' % self.ix)
         else:
@@ -113,6 +145,16 @@ class Layer(Net):
     def clone(self):
         return Layer(self.n_in, self.n_out, self.w, self.b, T.dvector("y[%i]" % self.ix))
 
+    def link(self, other):
+        self.children.append(other)
+        other.parents.append(self)
+
     def set_input(self, input):
         self.input = input
         self.output = 1. / (1. + T.exp(-T.dot(self.input, self.w) - self.b))
+
+    def add_loss_function(self, loss_function):
+        self.loss_function = loss_function.loss(self.output)
+        self.gw, self.gb = T.grad(self.loss_function, [self.w, self.b])
+        self.train = function([self.input, loss_function.goal], self.loss_function,
+                              updates=((self.w, self.w - self.w * self.gw * 0.01), (self.b, self.b - self.gb * 0.01)))
