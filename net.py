@@ -1,160 +1,196 @@
+import yaml
+
 import numpy as np
-from matplotlib import pyplot as plt
 
 import theano
-from theano import tensor as T
+from theano import tensor
 from theano import function
-from theano import pp
+
+
+class NoOutputException(Exception):
+    pass
 
 
 class SquaredLoss(object):
-    def __init__(self):
-        self.goal = T.dvector('y')
+    def __init__(self, n_goals):
+        self.goals = [tensor.dvector() for _ in range(n_goals)]
 
-    def loss(self, prediction):
-        return ((self.goal - prediction) ** 2).mean()
+    def loss(self, predictions):
+        return tensor.mean([(goal - prediction) ** 2 for (goal, prediction) in zip(self.goals, predictions)])
 
 
 class Net(object):
-    i = 0
-
-    def __init__(self):
-        self.ix = Net.i
-        Net.i += 1
-
-    def connect(self, other):
-        new_net = SuperNet()
-        if self.n_out != other.n_in:
-            raise Exception("dimensions don't match")
-        new_net.add_net(self.clone())
-        new_net.add_net(other.clone())
-        return new_net
+    def __init__(self, name, inputs, outputs, layers):
+        self.name = name
+        self.inputs = inputs
+        self.layers = layers
+        self.outputs = outputs
+        self._compiled = None
+        self.train = None
+        self.in_indices = dict([(inp.name, i) for (i, inp) in enumerate(self.inputs)])
+        self.out_indices = dict([(out.name, i) for (i, out) in enumerate(self.outputs)])
 
     @property
     def compiled(self):
-        try:
-            return self._compiled
-        except AttributeError:
-            self._compiled = function([self.input], self.output)
-            return self._compiled
+        if self._compiled is None:
+            self._compiled = function([i.x for i in self.inputs], [o.output for o in self.outputs])
+        return self._compiled
 
+    def f(self, **kwargs):
+        args = kwargs.values()
+        args = [args[self.in_indices[k]] for k in kwargs]
+        res = self.compiled(*args)
+        return dict(zip(self.out_indices, res))
 
-
-class SuperNet(Net):
-    def __init__(self):
-        Net.__init__(self)
-        self.layers = []
-
-    def add_net(self, net):
-        if self.layers:
-            net.set_input(self.output)
-        if type(net) is Layer:
-            self.layers.append(net)
-        elif type(net) is SuperNet:
-            self.layers += net.layers
-        else:
-            raise Exception("no")
-
-    def add_layers(self, layers):
-        self.layers += layers
-
-    def clone(self):
-        clone = SuperNet()
-        originals = self.traverse([self.root], [])
-        clones = dict((original, original.clone()) for original in originals)
-        for original in clones:
-            for child in original.children:
-                clones[original].link(clones[child])
-        clone.root = clones[self.root]
-        clone.leaf = clones[self.leaf]
-        return clone
-
-    @staticmethod
-    def traverse(candidates, result):
-        if candidates:
-            if candidates[0] not in result:
-                result.append(candidates[0])
-            return SuperNet.traverse(candidates[1:] + candidates[0].children, result)
-        else:
-            return result
-
-    def connect_layers(self):
-        last = self.layers[0]
-        for layer in self.layers[1:]:
-            layer.set_input(last.output)
-            last = layer
-
-    def set_input(self, input):
-        self.layers[0].set_input(input)
-
-    @property
-    def name(self):
-        return " > ".join([layer.name for layer in self.layers])
-
-    @property
-    def output(self):
-        return self.layers[-1].output
-
-    @property
-    def output_goal(self):
-        return self.layers[-1].output_goal
-
-    @property
-    def input(self):
-        return self.layers[0].input
-
-    @property
-    def n_in(self):
-        return self.layers[0].n_in
-
-    @property
-    def n_out(self):
-        return self.layers[-1].n_out
-
-    def add_loss_function(self, loss_function):
-        self.loss_function = loss_function.loss(self.output)
+    def add_loss_function(self, loss_function_class):
+        loss_function = loss_function_class(len(self.outputs))
         updates = []
         for layer in self.layers:
-            gw, gb = T.grad(self.loss_function, [layer.w, layer.b])
-            updates += [(layer.w, layer.w - layer.w * gw * 0.01), (layer.b, layer.b - gb * 0.01)]
-        self.train = function([self.input, loss_function.goal], self.loss_function, updates=updates)
+            dw, db = tensor.grad(loss_function.loss([o.output for o in self.outputs]), [layer.w, layer.b])
+            updates += [(layer.w, layer.w - dw * .01), (layer.b, layer.b - db * .01)]
+        self.train = function([self.inputs, loss_function.goal],
+                              loss_function, updates=updates)
+
+    def __repr__(self):
+        return self.name
 
 
-class Layer(Net):
-    def __init__(self, n_in, n_out, w=None, b=None, output_goal=None):
-        Net.__init__(self)
+class Layer(object):
+    def __init__(self, name, n_in, n_out):
+        self.name = name
         self.n_in = n_in
         self.n_out = n_out
-        self.parents = []
-        self.children = []
+        self.out_blocked = np.zeros(n_out, dtype=bool)
+
+    def block_output(self, from_, to):
+        if self.out_blocked[from_: to].any():
+            raise Exception("blocked")
+        self.out_blocked[from_: to] = True
+
+    def check(self):
+        if not self.out_blocked.any():
+            raise Exception("Layer %s: Not all outputs connected." % self.name)
+
+    def __repr__(self):
+        return "%s (%i>%i)" % (self.name, self.n_in, self.n_out)
+
+
+class Sigmoid(Layer):
+    def __init__(self, name, n_in, n_out, w=None, b=None):
+        Layer.__init__(self, name, n_in, n_out)
+        self.input = None
+        self.output = None
         if w is None:
-            self.w = theano.shared(np.random.randn(n_in, n_out), name='w[%i]' % self.ix)
+            self.w = theano.shared(np.random.randn(n_in, n_out), name='%s:w' % self.name)
         else:
             self.w = w
         if b is None:
-            self.b = theano.shared(np.zeros(n_out), name='b[%i]' % self.ix)
+            self.b = theano.shared(np.zeros(n_out), name='%s:b' % self.name)
         else:
             self.b = b
-        if output_goal is None:
-            self.output_goal = T.dvector("y[%i]" % self.ix)
-        else:
-            self.output_goal = output_goal
-        self.name = "[%i:%i,%i]" % (self.ix, n_in, n_out)
-        self.set_input(T.dvector("x[%i]" % self.ix))
 
-    def clone(self):
-        return Layer(self.n_in, self.n_out, self.w, self.b, T.dvector("y[%i]" % self.ix))
+    def clone(self, name):
+        return Sigmoid(name, self.n_in, self.n_out, self.w, self.b)
 
-    def link(self, other):
-        self.children.append(other)
-        other.parents.append(self)
+    def set_inputs(self, inputs):
+        """
+        :param inputs: [(input, (from, to)), ...]
+        :return:
+        """
+        if sum([len(np.zeros(i[0].n_out)[i[1][0]:i[1][1]]) for i in inputs]) != self.n_in:
+            raise Exception("Layer %s: Input dimensions don't match." % self.name)
+        ins = []
+        for (in_layer, range_) in inputs:
+            if in_layer.output is None:
+                raise NoOutputException("Has no output.")
+            ins.append(in_layer.output[range_[0]:range_[1]])
+        for (in_layer, range_) in inputs:
+            in_layer.block_output(range_[0], range_[1])
+        self.input = tensor.concatenate(ins)
+        self.output = 1 / (1 + tensor.exp(- tensor.dot(self.input, self.w) - self.b))
 
-    def set_input(self, input):
-        self.input = input
-        self.output = 1. / (1. + T.exp(-T.dot(self.input, self.w) - self.b))
 
-    def add_loss_function(self, loss_function):
-        self.loss_function = loss_function.loss(self.output)
-        self.gw, self.gb = T.grad(self.loss_function, [self.w, self.b])
-        self.train = function([self.input, loss_function.goal], self.loss_function,
-                              updates=((self.w, self.w - self.w * self.gw * 0.01), (self.b, self.b - self.gb * 0.01)))
+class Input(Layer):
+    def __init__(self, name, length):
+        self.x = tensor.dvector('x:%s' % name)
+        Layer.__init__(self, name, length, length)
+
+    @property
+    def output(self):
+        return self.x
+
+    def clone(self, name):
+        return Input(name, self.n_in)
+
+
+class Output(Layer):
+    def __init__(self, name, length):
+        Layer.__init__(self, name, length, length)
+        self.output = None
+
+    def set_inputs(self, inputs):
+        if sum([len(np.zeros(i[0].n_out)[i[1][0]:i[1][1]]) for i in inputs]) != self.n_in:
+            raise Exception("Output %s: Input dimensions don't match." % self.name)
+        for i in inputs:
+            if i[0].output is None:
+                raise NoOutputException("Has no output.")
+        for i in inputs:
+            i[0].block_output(i[1][0], i[1][1])
+        inp = [i[0].output[i[1][0]:i[1][1]] for i in inputs]
+        self.output = tensor.concatenate(inp)
+
+    def check(self):
+        if self.output is None:
+            raise Exception("Output %s not used.")
+
+    def clone(self, name):
+        return Output(name, self.n_in)
+
+
+class Dings(object):
+    def __init__(self, inputs, outputs, layers):
+        self.inputs = {}
+        for i in inputs:
+            self.inputs[i['name']] = Input(i['name'], i['length'])
+        self.outputs = {}
+        for o in outputs:
+            self.outputs[o['name']] = Output(o['name'], o['length'])
+        self.layers = {}
+        for l in layers:
+            self.layers[l['name']] = Sigmoid(l['name'], l['n_in'], l['n_out'])
+        self.nets = {}
+
+    def create_net(self, setup):
+        inputs = dict([(i, self.inputs[i].clone(i)) for i in setup['inputs']])
+        outputs = {}
+        for name, args in setup['outputs'].iteritems():
+            outputs[name] = self.outputs[name].clone(name)
+        layers = {}
+        for name, args in setup['layers'].iteritems():
+            layers[name] = self.layers[args['prototype']].clone(name)
+        all_ = dict(inputs.items() + outputs.items() + layers.items())
+        todo = setup['layers'].items() + setup['outputs'].items()
+        while todo:
+            name, args = todo.pop(0)
+            try:
+                i_s = []
+                for i in args['in']:
+                    if type(i) is list:
+                        i_s.append((all_[i[0]], (i[1], i[2])))
+                    else:
+                        i_s.append((all_[i], (None, None)))
+                all_[name].set_inputs(i_s)
+            except NoOutputException:
+                todo.append((name, args))
+        return Net(setup['name'], inputs.values(), outputs.values(), layers.values())
+
+    @staticmethod
+    def from_yaml(filename):
+        with open(filename, 'r') as f:
+            r = yaml.load(f)
+
+        d = Dings(r['inputs'], r['outputs'], r['layers'])
+        for net in r['networks']:
+            d.nets[net['name']] = d.create_net(net)
+
+        return d
