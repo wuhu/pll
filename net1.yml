@@ -1,0 +1,208 @@
+params:
+  - &nx 100
+  - &nxy 100
+  - &hiddenx 100
+  - &hiddenxy 100
+  - &hiddenx_times_2_plus_nxy 300
+inputs:
+  - name: ia
+    length: *nx
+  - name: ib
+    length: *nx
+  - name: ic
+    length: *nx
+  - name: iab
+    length: *nxy
+  - name: iba
+    length: *nxy
+  - name: ibc
+    length: *nxy
+  - name: icb
+    length: *nxy
+  - name: ica
+    length: *nxy
+  - name: iac
+    length: *nxy
+outputs:
+  - name: oa
+    length: *nx
+  - name: ob
+    length: *nx
+  - name: oc
+    length: *nx
+  - name: oaa
+    length: *nxy
+  - name: obb
+    length: *nxy
+  - name: occ
+    length: *nxy
+  - name: oab
+    length: *nxy
+  - name: oba
+    length: *nxy
+  - name: obc
+    length: *nxy
+  - name: ocb
+    length: *nxy
+  - name: oca
+    length: *nxy
+  - name: oac
+    length: *nxy
+sums:
+  - name: x
+    n_in: *nx
+    n_out: *hiddenx1
+  - name: x_
+    n_in: *nxy
+    n_out: *hiddenx1
+  - name: _x
+    n_in: *nxy
+    n_out: *hiddenx1
+  - name: xx
+    n_in: *nxy
+    n_out: *hiddenx1
+  - name: x2
+    n_in: *hiddenx1
+    n_out: *hiddenx2
+  - name: x3
+    n_in: *hiddenx2
+    n_out: *nx
+sigmoids:
+  - name: shiddenx1
+    n_in: *hiddenx1
+  - name: shiddenx2
+    n_in: *nhidden2
+  - name: sx
+    n_in: *nx
+vector_sums:
+  - name: vsx
+    n_in: hiddenx1
+
+protonets:
+  nx:
+    x:
+      in: ix
+      prototype: x
+    xx:
+      in: ixx
+      prototype: xx
+    xy:
+      in: ixy
+      prototype: x_
+    yx:
+      in: iyx
+      prototype: _x
+    xz:
+      in: ixz
+      prototype: x_
+    zx:
+      in: izx
+      prototype: _x
+    vsx:
+      in: [x, xx, xy, yx, xz, zx]
+      prototype: vsx
+    shiddenx1:
+      in: vsx
+      prototype: shiddenx1
+    x2:
+      in: shiddenx1
+      prototype: x2
+    shiddenx2:
+      in: x2
+      prototype: shiddenx2
+    x3:
+      in: shiddenx2
+      prototype: x3
+    sx:
+      in: x3
+      prototype: sx
+  nxy:
+    xy1:
+      in: [ix, ix, ixy, iyx, ixx, iyy, ixz, izx, iyz, izy]
+      prototype: xy1
+    sxy1:
+      in: xy1
+      prototype: sxy1
+    xy2:
+      in: xy1
+      prototype: xy2
+    sxy2:
+      in: xy2
+      prototype: sxy2
+    xy3:
+      in: xy2
+      prototype: xy3
+    sxy3:
+      in: xy3
+      prototype: sxy3
+  nxx:
+    xx1:
+      in: [ix, ixx, ixy, iyx, ixz, izx]
+      prototype: xx1
+    sxx1:
+      in: xx1
+      prototype: sxx1
+    xx2:
+      in: sxx1
+      prototype: xx2
+    sxx2:
+      in: xx2
+      prototype: sxx2
+    xx3:
+      in: sxx2
+      prototype: xx3
+
+
+networks:
+  - name: na
+    prototype: nx
+    substitutions: {x: a, y: b, z: c}
+  - name: nb
+    prototype: nx
+    substitutions: {x: b, y: z, z: a}
+  - name: nc
+    prototype: nx
+    substitutions: {x: c, y: a, z: b}
+  - name: nab
+    prototype: nxy
+    substitutions: {x: a, y: b, z: c}
+  - name: nba
+    prototype: nxy
+    substitutions: {x: b, y: a, z: c}
+  - name: nac
+    prototype: nxy
+    substitutions: {x: a, y: c, z: b}
+  - name: nca
+    prototype: nxy
+    substitutions: {x: c, y: a, z: b}
+  - name: ncb
+    prototype: nxy
+    substitutions: {x: c, y: b, z: a}
+  - name: nbc
+    prototype: nxy
+    substitutions: {x: b, y: c, z: a}
+  - name: naa
+    prototype: nxx
+    substitutions: {x: a, y: b, z: c}
+  - name: nbb
+    prototype: nxx
+    substitutions: {x: b, y: a, z: c}
+  - name: ncc
+    prototype: nxx
+    substitutions: {x: c, y: b, z: a}
+
+  - name: nnn
+    subnets: [na, nb, nc, naa, nbb, ncc, nab, nba, nac, nca, ncb, nbc]
+    outputs:
+      - oa: sa
+      - ob: sb
+      - oc: sc
+      - oaa
+      - obb
+      - occ
+      - oab: sab3
+      - oba: sba3
+      - obc: sbc3
+      - ocb: scb3
+      - oca: sca3
+      - oac: sac3

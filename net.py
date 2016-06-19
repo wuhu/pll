@@ -20,10 +20,11 @@ class SquaredLoss(object):
 
 
 class Net(object):
-    def __init__(self, name, inputs, outputs, layers):
+    def __init__(self, name, inputs, outputs, sigmoids, sums):
         self.name = name
         self.inputs = inputs
-        self.layers = layers
+        self.sigmoids = sigmoids
+        self.sums = sums
         self.outputs = outputs
         self._compiled = None
         self.train = None
@@ -45,7 +46,7 @@ class Net(object):
     def add_loss_function(self, loss_function_class):
         loss_function = loss_function_class(len(self.outputs))
         updates = []
-        for layer in self.layers:
+        for layer in self.sums:
             dw, db = tensor.grad(loss_function.loss([o.output for o in self.outputs]), [layer.w, layer.b])
             updates += [(layer.w, layer.w - dw * .01), (layer.b, layer.b - db * .01)]
         self.train = function([self.inputs, loss_function.goal],
@@ -62,11 +63,6 @@ class Layer(object):
         self.n_out = n_out
         self.out_blocked = np.zeros(n_out, dtype=bool)
 
-    def block_output(self, from_, to):
-        if self.out_blocked[from_: to].any():
-            raise Exception("blocked")
-        self.out_blocked[from_: to] = True
-
     def check(self):
         if not self.out_blocked.any():
             raise Exception("Layer %s: Not all outputs connected." % self.name)
@@ -75,7 +71,48 @@ class Layer(object):
         return "%s (%i>%i)" % (self.name, self.n_in, self.n_out)
 
 
-class Sigmoid(Layer):
+class SigmoidLayer(Layer):
+    def __init__(self, name, n_in):
+        Layer.__init__(self, name, n_in, n_in)
+        self.input = None
+        self.output = None
+
+    def clone(self, name):
+        return SigmoidLayer(name, self.n_in)
+
+    def set_inputs(self, inputs):
+        """
+        :param inputs: [(input, (from, to)), ...]
+        :return:
+        """
+        if sum([len(np.zeros(i[0].n_out)[i[1][0]:i[1][1]]) for i in inputs]) != self.n_in:
+            raise Exception("Layer %s: Input dimensions don't match." % self.name)
+        ins = []
+        for (in_layer, range_) in inputs:
+            if in_layer.output is None:
+                raise NoOutputException("Has no output.")
+            ins.append(in_layer.output[range_[0]:range_[1]])
+        self.input = tensor.concatenate(ins)
+        self.output = 1 / (1 + tensor.exp(- self.input))
+
+
+class VectorSum(Layer):
+    def __init__(self, name, n_in):
+        Layer.__init__(self, name, n_in, n_in)
+        self.output = None
+        self.input = None
+
+    def set_inputs(self, inputs):
+        ins = []
+        for (in_layer, range_) in inputs:
+            if in_layer.output is None:
+                raise NoOutputException("Has no output.")
+            ins.append(in_layer.output[range_[0]:range_[1]])
+        self.input = ins
+        self.output = tensor.sum(ins, 0)
+
+
+class SumLayer(Layer):
     def __init__(self, name, n_in, n_out, w=None, b=None):
         Layer.__init__(self, name, n_in, n_out)
         self.input = None
@@ -90,7 +127,7 @@ class Sigmoid(Layer):
             self.b = b
 
     def clone(self, name):
-        return Sigmoid(name, self.n_in, self.n_out, self.w, self.b)
+        return SumLayer(name, self.n_in, self.n_out, self.w, self.b)
 
     def set_inputs(self, inputs):
         """
@@ -104,10 +141,8 @@ class Sigmoid(Layer):
             if in_layer.output is None:
                 raise NoOutputException("Has no output.")
             ins.append(in_layer.output[range_[0]:range_[1]])
-        for (in_layer, range_) in inputs:
-            in_layer.block_output(range_[0], range_[1])
         self.input = tensor.concatenate(ins)
-        self.output = 1 / (1 + tensor.exp(- tensor.dot(self.input, self.w) - self.b))
+        self.output = tensor.dot(self.input, self.w) + self.b
 
 
 class Input(Layer):
@@ -134,8 +169,6 @@ class Output(Layer):
         for i in inputs:
             if i[0].output is None:
                 raise NoOutputException("Has no output.")
-        for i in inputs:
-            i[0].block_output(i[1][0], i[1][1])
         inp = [i[0].output[i[1][0]:i[1][1]] for i in inputs]
         self.output = tensor.concatenate(inp)
 
@@ -148,16 +181,22 @@ class Output(Layer):
 
 
 class Dings(object):
-    def __init__(self, inputs, outputs, layers):
+    def __init__(self, inputs, outputs, sigmoids, sums, vector_sums):
         self.inputs = {}
         for i in inputs:
             self.inputs[i['name']] = Input(i['name'], i['length'])
         self.outputs = {}
         for o in outputs:
             self.outputs[o['name']] = Output(o['name'], o['length'])
-        self.layers = {}
-        for l in layers:
-            self.layers[l['name']] = Sigmoid(l['name'], l['n_in'], l['n_out'])
+        self.sigmoids = {}
+        for s in sigmoids:
+            self.sigmoids[s['name']] = SigmoidLayer(s['name'], s['n_in'])
+        self.sums = {}
+        for s in sums:
+            self.sums[s['name']] = SumLayer(s['name'], s['n_in'], s['n_out'])
+        self.vector_sums = {}
+        for s in vector_sums:
+            self.vector_sums[s['name']] = VectorSum(s['name'], s['n_in'], s['n_out'])
         self.nets = {}
 
     def create_net(self, setup):
@@ -165,11 +204,18 @@ class Dings(object):
         outputs = {}
         for name, args in setup['outputs'].iteritems():
             outputs[name] = self.outputs[name].clone(name)
-        layers = {}
-        for name, args in setup['layers'].iteritems():
-            layers[name] = self.layers[args['prototype']].clone(name)
-        all_ = dict(inputs.items() + outputs.items() + layers.items())
-        todo = setup['layers'].items() + setup['outputs'].items()
+        sigmoids = {}
+        for name, args in setup['sigmoids'].iteritems():
+            sigmoids[name] = self.sigmoids[args['prototype']].clone(name)
+        sums = {}
+        for name, args in setup['sums'].iteritems():
+            sums[name] = self.sums[args['prototype']].clone(name)
+        vector_sums = {}
+        for name, args in setup['vector_sums'].iteritems():
+            vector_sums[name] = self.vector_sums[args['prototype']].clone(name)
+        all_ = dict(inputs.items() + outputs.items() + sigmoids.items() +
+                    sums.items() + vector_sums.items())
+        todo = setup['sigmoids'].items() + setup['outputs'].items() + setup['sums'].items()
         while todo:
             name, args = todo.pop(0)
             try:
@@ -182,14 +228,14 @@ class Dings(object):
                 all_[name].set_inputs(i_s)
             except NoOutputException:
                 todo.append((name, args))
-        return Net(setup['name'], inputs.values(), outputs.values(), layers.values())
+        return Net(setup['name'], inputs.values(), outputs.values(), sigmoids.values(), sums.values())
 
     @staticmethod
     def from_yaml(filename):
         with open(filename, 'r') as f:
             r = yaml.load(f)
 
-        d = Dings(r['inputs'], r['outputs'], r['layers'])
+        d = Dings(r['inputs'], r['outputs'], r['sigmoids'], r['sums'])
         for net in r['networks']:
             d.nets[net['name']] = d.create_net(net)
 
