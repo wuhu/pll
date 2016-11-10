@@ -12,7 +12,7 @@ class CLI(cmd.Cmd):
     def do_dream(self, n):
         print 'Dreaming...'
         return False
-        # TODO implement learing
+        # TODO implement learning
 
     def do_list(self, what):
         if what.lower() == 'functions':

@@ -20,9 +20,10 @@ class SquaredLoss(object):
 
 
 class Net(object):
-    def __init__(self, name, inputs, outputs, sigmoids, sums):
+    def __init__(self, name, inputs, outputs, sigsums, sigmoids, sums):
         self.name = name
         self.inputs = inputs
+        self.sigsums = sigsums
         self.sigmoids = sigmoids
         self.sums = sums
         self.outputs = outputs
@@ -30,6 +31,7 @@ class Net(object):
         self.train = None
         self.in_indices = dict([(inp.name, i) for (i, inp) in enumerate(self.inputs)])
         self.out_indices = dict([(out.name, i) for (i, out) in enumerate(self.outputs)])
+        self.out_dict = dict([(out.name, out) for out in self.outputs])
 
     @property
     def compiled(self):
@@ -49,8 +51,7 @@ class Net(object):
         for layer in self.sums:
             dw, db = tensor.grad(loss_function.loss([o.output for o in self.outputs]), [layer.w, layer.b])
             updates += [(layer.w, layer.w - dw * .01), (layer.b, layer.b - db * .01)]
-        self.train = function([self.inputs, loss_function.goal],
-                              loss_function, updates=updates)
+        self.train = function([self.inputs, loss_function.goal], loss_function, updates=updates)
 
     def __repr__(self):
         return self.name
@@ -110,6 +111,28 @@ class VectorSum(Layer):
             ins.append(in_layer.output[range_[0]:range_[1]])
         self.input = ins
         self.output = tensor.sum(ins, 0)
+
+
+class SigSumLayer(Layer):
+    def __init__(self, name, n_in, n_out, w=None, b=None):
+        Layer.__init__(self, name, n_in, n_out)
+        self.sum_layer = SumLayer(name + "_sum", n_in, n_out, w, b)
+        self.sigmoid_layer = SigmoidLayer(name + "_sig", n_out)
+
+    def clone(self, name):
+        return SigSumLayer(name, self.n_in, self.n_out, self.sum_layer.w, self.sum_layer.b)
+
+    def set_inputs(self, inputs):
+        self.sum_layer.set_inputs(inputs)
+        self.sigmoid_layer.set_inputs([(self.sum_layer, (None, None))])
+
+    @property
+    def output(self):
+        return self.sigmoid_layer.output
+
+    @property
+    def input(self):
+        return self.sum_layer.output
 
 
 class SumLayer(Layer):
@@ -181,7 +204,7 @@ class Output(Layer):
 
 
 class Dings(object):
-    def __init__(self, inputs, outputs, sigmoids, sums, vector_sums):
+    def __init__(self, inputs, outputs, sigsums=(), sigmoids=(), sums=(), vector_sums=()):
         self.inputs = {}
         for i in inputs:
             self.inputs[i['name']] = Input(i['name'], i['length'])
@@ -191,32 +214,53 @@ class Dings(object):
         self.sigmoids = {}
         for s in sigmoids:
             self.sigmoids[s['name']] = SigmoidLayer(s['name'], s['n_in'])
+        self.sigsums = {}
+        for s in sigsums:
+            self.sigsums[s['name']] = SigSumLayer(s['name'], s['n_in'], s['n_out'])
         self.sums = {}
         for s in sums:
             self.sums[s['name']] = SumLayer(s['name'], s['n_in'], s['n_out'])
         self.vector_sums = {}
         for s in vector_sums:
-            self.vector_sums[s['name']] = VectorSum(s['name'], s['n_in'], s['n_out'])
+            self.vector_sums[s['name']] = VectorSum(s['name'], s['n_in'])
         self.nets = {}
 
     def create_net(self, setup):
+        if "sigmoids" not in setup:
+            setup["sigmoids"] = {}
+        if "sums" not in setup:
+            setup["sums"] = {}
+        if "sigsums" not in setup:
+            setup["sigsums"] = {}
+        if "vector_sums" not in setup:
+            setup["vector_sums"] = {}
+
         inputs = dict([(i, self.inputs[i].clone(i)) for i in setup['inputs']])
+
         outputs = {}
         for name, args in setup['outputs'].iteritems():
             outputs[name] = self.outputs[name].clone(name)
+
         sigmoids = {}
         for name, args in setup['sigmoids'].iteritems():
             sigmoids[name] = self.sigmoids[args['prototype']].clone(name)
+
         sums = {}
         for name, args in setup['sums'].iteritems():
             sums[name] = self.sums[args['prototype']].clone(name)
+
+        sigsums = {}
+        for name, args in setup['sigsums'].iteritems():
+            sigsums[name] = self.sigsums[args['prototype']].clone(name)
         vector_sums = {}
         for name, args in setup['vector_sums'].iteritems():
             vector_sums[name] = self.vector_sums[args['prototype']].clone(name)
-        all_ = dict(inputs.items() + outputs.items() + sigmoids.items() +
+        all_ = dict(inputs.items() + outputs.items() + sigmoids.items() + sigsums.items() +
                     sums.items() + vector_sums.items())
-        todo = setup['sigmoids'].items() + setup['outputs'].items() + setup['sums'].items()
+        todo = (setup['sigmoids'].items() + setup['outputs'].items() + setup['sums'].items() +
+                setup['sigsums'].items())
         while todo:
+            print todo
             name, args = todo.pop(0)
             try:
                 i_s = []
@@ -228,14 +272,15 @@ class Dings(object):
                 all_[name].set_inputs(i_s)
             except NoOutputException:
                 todo.append((name, args))
-        return Net(setup['name'], inputs.values(), outputs.values(), sigmoids.values(), sums.values())
+        return Net(setup['name'], inputs.values(), outputs.values(), sigsums.values(),
+                   sigmoids.values(), sums.values())
 
     @staticmethod
     def from_yaml(filename):
         with open(filename, 'r') as f:
             r = yaml.load(f)
 
-        d = Dings(r['inputs'], r['outputs'], r['sigmoids'], r['sums'])
+        d = Dings(r['inputs'], r['outputs'], r['sigsums'], r['sigmoids'], r['sums'])
         for net in r['networks']:
             d.nets[net['name']] = d.create_net(net)
 

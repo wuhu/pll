@@ -3,6 +3,12 @@ from itertools import permutations, product
 import numpy as np
 import re
 
+import net
+
+import theano
+from theano import tensor
+from theano import function
+
 
 def red(x):
     return "\033[0;31m" + x + "\033[0m"
@@ -57,12 +63,12 @@ class Rule(object):
         except:
             pass
         else:
-            if v < .25:
+            """if v < .25:
                 imp = red(imp)
             elif v > .75:
                 imp = green(imp)
             else:
-                imp = yellow(imp)
+                imp = yellow(imp)"""
         return (self.head.__repr__() + imp +
                 ", ".join([f.__repr__() for f in self.tail]))
 
@@ -91,18 +97,13 @@ class Rule(object):
 
     @property
     def val(self):
-        tailvals = [x.val for x in self.tail]
-        a = self.head.val
-        b = self.onefalse(tailvals)
-        # alternative: 1 - (1 - a) * np.prod(tailvals)
-        return a + (1. - a) * b
-
-    @classmethod
-    def onefalse(cls, t):
-        if not len(t):
-            return 0.
-        else:
-            return (1. - t[0]) + t[0] * cls.onefalse(t[1:])
+        """ Probability that the rule is true given the truth values of its components.
+        => head is true or at least one part of the tail is false
+        <=> not (head is false and all parts of the tail are true)
+        this assumes independency
+        :return:
+        """
+        return 1 - (1 - self.head.val) * net.tensor.prod([x.val for x in self.tail])
 
 
 class Function(object):
@@ -112,6 +113,7 @@ class Function(object):
         self.free_args = [x for x in self.args if x in ['X', 'Y', 'Z']]
         self.arity = len(args)
         self.is_abstract = 'X' in args or 'Y' in args or 'Z' in args
+        self.address = None
         if add_to_cortex:
             cortex.add_function(self)
 
@@ -166,88 +168,24 @@ class Function(object):
         subs = []
         for from_ in self.free_args:
             for to in ['a', 'b', 'c']:
-                subs += self.substitute(
-                            from_, to,
-                            add_to_cortex).substitutions(add_to_cortex)
+                subs += self.substitute(from_, to, add_to_cortex).substitutions(add_to_cortex)
         return list(set(subs))
 
     @property
     def val(self):
-        try:
-            return cortex.state["".join(self.args)][self.address]
-        except AttributeError:
+        if self.address is None:
             raise Exception("Has no address.")
-    
-    @val.setter
-    def val(self, value):
-        try:
-            cortex.state["".join(self.args)][self.address] = value
-        except AttributeError:
-            raise Exception("Has no address.")
-
-
-class Net(object):
-    def __init__(self, abstract_mapping, cortex):
-        self.cortex = cortex
-        self._abstract_mapping = abstract_mapping
-        self._substitute_all()
-
-    def _substitute(self, from_, to, abstract):
-        for f, t in zip(from_, to):
-            abstract = abstract.replace(f, t)
-        return abstract
-    
-    def _substitute_all(self):
-        substitutions = []
-        for p in permutations(["a", "b", "c"]):
-            s = self._substitute(["X", "Y", "Z"], p, self._abstract_mapping)
-            substitutions.append(tuple(s.split(" -> ")))
-        self.concrete_mappings = list(set(substitutions))
-
-    def __repr__(self):
-        return self._abstract_mapping
-        
+        return cortex.state["".join(self.args)].output[self.address]
 
 
 class Cortex(object):
     def __init__(self):
         fields = ["".join(x) for x in product('abc')] \
                  + ["".join(x) for x in product('abc', repeat=2)]
-        self.state = dict(zip(fields,
-                               [CArray() for _ in range(len(fields))]))
+        self.address_counters = dict(zip(fields, [self.Counter() for _ in range(len(fields))]))
         self.functions = {}
         self.names = []
-        """
-        eher so:
-        X, Y, XY, YX, XX, YY, XZ, ZX, YZ, ZY - > XY
-        oder so:
-        X -> X
-        X, Y -> XY
-        X, Y -> YX
-        nicht so:
-        """
-        self.nets = [
-            Net("X -> X", self),
-            Net("X, Y -> XY", self),
-            Net("X, Y -> YX", self)
-        ]
-        """
-        self.nets = [
-            Net("X -> X", self),
-            Net("X -> XY", self),
-            Net("XY -> XY", self),
-            Net("XY -> YX", self),
-            Net("XX -> XY", self),
-            Net("X -> YX", self),
-            Net("XX -> XX", self),
-            Net("XX -> YX", self),
-            Net("XY -> XX", self),
-            Net("XY -> XZ", self),
-            Net("XY -> YY", self),
-            Net("XY -> YZ", self),
-            Net("XY -> ZX", self),
-            Net("XY -> ZY", self)]
-        """
+        self.state = []
 
     def add_function(self, function):
         if function.name in self.names:
@@ -255,10 +193,79 @@ class Cortex(object):
                 function.address = self.functions[function]
             return
         for f in function.abstract().substitutions(False):
-            i = self.state["".join(f.args)].grow()
+            i = self.address_counters["".join(f.args)].next()
             self.functions[f] = i
             f.address = i
         self.names.append(function.name)
+
+    class Counter(object):
+        def __init__(self):
+            self.c = 0
+
+        def next(self):
+            c = self.c
+            self.c += 1
+            return c
+
+        def __len__(self):
+            return self.c
+
+    def create_net(self):
+        n_hidden_x = [10, 10]
+        n_hidden_xy = [10, 10]
+        l_in = 10
+        l_out_x = len(self.address_counters['a'])
+        l_out_xy = len(self.address_counters['aa'])
+        inputs = [{"name": 'in_' + name, "length": l_in}
+                  for name in ['a', 'b', 'c']]
+        outputs_x = [{"name": "".join(x), "length": l_out_x}
+                     for x in product('abc')]
+        outputs_xy = [{"name": "".join(x), "length": l_out_xy}
+                      for x in product('abc', repeat=2)]
+        outputs = outputs_x + outputs_xy
+
+        in_layer_length = l_in
+        hidden = []
+        for i, layer_length in enumerate(n_hidden_x):
+            hidden.append({"name": "hidden_x_%i" % i,
+                           "n_in": in_layer_length,
+                           "n_out": layer_length})
+            in_layer_length = layer_length
+        hidden.append({"name": "hidden_x_o",
+                       "n_in": in_layer_length,
+                       "n_out": l_out_x})
+        in_layer_length *= 2
+        for i, layer_length in enumerate(n_hidden_xy):
+            hidden.append({"name": "hidden_xy_%i" % i,
+                           "n_in": in_layer_length,
+                           "n_out": layer_length})
+            in_layer_length = layer_length
+        hidden.append({"name": "hidden_xy_o",
+                       "n_in": in_layer_length,
+                       "n_out": l_out_xy})
+
+        nnet = {"name": "cortex", "sigsums": {}, "outputs": {}, "inputs": [i['name'] for i in inputs]}
+        for letter in 'abc':
+            in_layer = "in_%s" % letter
+            for i, layer_length in enumerate(n_hidden_x):
+                name = "hidden_%s_%i" % (letter, i)
+                nnet["sigsums"][name] = {"in": [in_layer], "prototype": "hidden_x_%i" % i}
+                in_layer = name
+            nnet["sigsums"]["hidden_%s_o" % letter] = {"in": [in_layer], "prototype": "hidden_x_o"}
+            nnet["outputs"]["%s" % letter] = {"in": ["hidden_%s_o" % letter]}
+        for letters in product('abc', repeat=2):
+            in_layer = ["hidden_%s_%i" % (letter, len(n_hidden_x) - 1) for letter in letters]
+            for i, layer_length in enumerate(n_hidden_xy):
+                name = "hidden_%s%s_%i" % (letters + (i,))
+                nnet["sigsums"][name] = {"in": in_layer, "prototype": "hidden_xy_%i" % i}
+                in_layer = [name]
+            nnet["sigsums"]["hidden_%s%s_o" % letters] = {"in": in_layer,
+                                                          "prototype": "hidden_xy_o"}
+            nnet["outputs"]["%s%s" % letters] = {"in": ["hidden_%s%s_o" % letters]}
+        self.d = net.Dings(inputs, outputs, hidden)
+        self.net = self.d.create_net(nnet)
+        self.state = self.net.out_dict
+        self.setup = {"outputs": outputs, "sigsums": hidden, "inputs": inputs, "network": nnet}
 
 
 class CArray(object):
@@ -282,5 +289,6 @@ class CArray(object):
 
     def __setitem__(self, i, val):
         return self.data.__setitem__(i, val)
+
 
 cortex = Cortex()
