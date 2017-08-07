@@ -1,4 +1,5 @@
 from itertools import permutations, product
+from collections import defaultdict
 
 import numpy as np
 import re
@@ -8,6 +9,7 @@ import net
 import theano
 from theano import tensor
 from theano import function
+from theano.gradient import DisconnectedInputError
 
 
 def red(x):
@@ -22,70 +24,96 @@ def yellow(x):
     return "\033[0;33m" + x + "\033[0m"
 
 
-class Rule(object):
-    def __init__(self, head, tail):
+GROUND_VARS = 'abc';
+
+
+class Clause(object):
+    def __init__(self, head, tail, headneg, tailneg):
         self.head = head
         self.tail = tail
+        self.headneg = headneg
+        self.tailneg = tailneg
         self.is_abstract = any(map(lambda x: x.is_abstract, [self.head] + self.tail))
+        self.is_very_abstract = all(map(lambda x: x.is_very_abstract, [self.head] + self.tail))
         self.args = set(self.head.args +
                         reduce(lambda x, y: x + y.args, self.tail, []))
         self.free_args = [x for x in self.args if x in ['X', 'Y', 'Z']]
+        self._val_function = None
+        if self.is_very_abstract:
+            cortex.add_abstract_clause(self)
 
     @staticmethod
     def from_str(string):
         string = string.replace(" ", "")
         headtail = re.compile(
-            "^(?P<head>(?:[a-zA-Z]+)\((?:[XYZ])(?:,(?:[XYZ]))?\))"
-            ":-(?P<tail>(?:(?:[a-zA-Z]+)\((?:[XYZ])(?:,(?:[XYZ]"
-            "))?\))(?:,(?:[a-zA-Z]+)\((?:[XYZ])(?:,(?:[XYZ]))?\))*)$")
+            "^(?P<headneg>-?)(?P<head>(?:[a-zA-Z]+)\((?:[XYZ])(?:,(?:[XYZ]))?\))"
+            ":-(?P<tail>-?(?:(?:[a-zA-Z]+)\((?:[XYZ])(?:,(?:[XYZ]"
+            "))?\))(?:,-?(?:[a-zA-Z]+)\((?:[XYZ])(?:,(?:[XYZ]))?\))*)$")
         resm = headtail.match(string)
         if resm is None:
             raise ValueError("Wrong syntax!")
 
         res = resm.groupdict()
+        print res
         self_head = Function.from_str(res['head'])
+        self_headneg = res['headneg'] == '-'
+
 
         tail = res['tail']
         funlist = re.compile(
-            "((?:[a-zA-Z]+)\((?:[XYZ])(?:,(?:[XYZ]))?\))(?:"
+            "(-?(?:[a-zA-Z]+)\((?:[XYZ])(?:,(?:[XYZ]))?\))(?:"
             ",(.+))?$")
         head, rest = funlist.match(tail).groups()
+        self_tailneg = []
+        if head.startswith("-"):
+            self_tailneg.append(True)
+            head = head[1:]
+        else:
+            self_tailneg.append(False)
         self_tail = [Function.from_str(head)]
         while rest:
             head, rest = funlist.match(rest).groups()
+            if head.startswith("-"):
+                self_tailneg.append(True)
+                head = head[1:]
+            else:
+                self_tailneg.append(False)
             self_tail.append(Function.from_str(head))
-        return Rule(self_head, self_tail)
+        return Clause(self_head, self_tail, self_headneg, self_tailneg)
 
     def __repr__(self):
         imp = " :- "
         try:
             v = self.val
         except:
-            pass
+            v_str = ""
         else:
-            """if v < .25:
+            if v < .25:
                 imp = red(imp)
             elif v > .75:
                 imp = green(imp)
             else:
-                imp = yellow(imp)"""
-        return (self.head.__repr__() + imp +
-                ", ".join([f.__repr__() for f in self.tail]))
+                imp = yellow(imp)
+            v_str = " [%.2f]" % v
+        return ("-" if self.headneg else "") + self.head.__repr__() + imp + ", ".join(
+                [("-" if tn else "") + f.__repr__() for (f, tn) in
+                    zip(self.tail, self.tailneg)]) + v_str
 
     def __str__(self):
-        return (self.head.__str__() + " :- " +
-                ", ".join([f.__str__() for f in self.tail]))
+        return (("-" if self.headneg else "") + self.head.__str__() + " :- " +
+                ", ".join([("-" if tn else "") + f.__str__() for (f, tn) in
+                    zip(self.tail, self.tailneg)]))
 
     def substitute(self, from_, to):
-        return Rule(self.head.substitute(from_, to),
-                    map(lambda x: x.substitute(from_, to), self.tail))
+        return Clause(self.head.substitute(from_, to), map(lambda x: x.substitute(from_, to), self.tail),
+                      self.headneg, self.tailneg)
 
     def substitutions(self):
         if not self.is_abstract:
             return [self]
         subs = []
         for from_ in self.free_args:
-            for to in ['a', 'b', 'c']:
+            for to in GROUND_VARS:
                 subs += self.substitute(from_, to).substitutions()
         return list(set(subs))
 
@@ -96,14 +124,82 @@ class Rule(object):
         return hash(self.__str__())
 
     @property
-    def val(self):
-        """ Probability that the rule is true given the truth values of its components.
+    def val_(self):
+        """ Probability that the clause is true given the truth values of its components.
         => head is true or at least one part of the tail is false
         <=> not (head is false and all parts of the tail are true)
         this assumes independency
         :return:
         """
-        return 1 - (1 - self.head.val) * net.tensor.prod([x.val for x in self.tail])
+        def neg(val, isneg):
+            if isneg:
+                return 1 - val
+            else:
+                return val
+        return 1 - (1 - neg(self.head.t_val, self.headneg)) * net.tensor.prod([neg(x.t_val, n) for (x, n) in zip(self.tail, self.tailneg)])
+
+    @property
+    def log_val(self):
+        return net.tensor.log(self.val_)
+
+    @property
+    def val(self):
+        if self._val_function is None:
+            self._val_function = net.function([], self.val_)
+        return self._val_function()
+
+
+class ClauseCollection(object):
+    def __init__(self, head, clauses):
+        self.head = head
+        for clause in clauses:
+            assert(clause.head == self.head)
+        self.clauses = clauses
+        self.is_abstract = any(map(lambda x: x.is_abstract, clauses))
+        self.is_very_abstract = all(map(lambda x: x.is_very_abstract, clauses))
+        self.args = set(reduce(lambda x, y: x + list(y.args), self.clauses, []))
+        self.free_args = [x for x in self.args if x in ['X', 'Y', 'Z']]
+        if self.is_very_abstract:
+            cortex.add_abstract_clause(self)
+
+    def val(self):
+        # all tails false
+        nope = net.tensor.prod([(1. - clause.tail.t_val) for clause in self.clauses])
+        # -> head must be false too
+        ok_if_nope = (1. - self.head.t_val) * nope
+        # at least one tail true -> head must be true
+        ok_if_yep = self.head_val * (1. - nope)
+        return ok_if_nope + ok_if_yep
+
+    def substitute(self, from_, to):
+        return ClauseCollection(self.head.substitute(from_, to), map(lambda x: x.substitute(from_, to), self.clauses))
+
+    def substitutions(self):
+        if not self.is_abstract:
+            return [self]
+        subs = []
+        for from_ in self.free_args:
+            for to in GROUND_VARS:
+                subs += self.substitute(from_, to).substitutions()
+        return list(set(subs))
+
+    def __str__(self):
+        return "\n".join([str(c) + "." for c in self.clauses])
+
+    def __repr__(self):
+        return str(self)
+
+    def __eq__(self, other):
+        return self.__str__() == other.__str__()
+
+    def __hash__(self):
+        return hash(self.__str__())
+
+
+class Atom(object):
+    def __init__(self, name):
+        self.name = name
+        self.val = theano.shared(np.random.randn(length), 'x:%s' % name)
 
 
 class Function(object):
@@ -113,7 +209,9 @@ class Function(object):
         self.free_args = [x for x in self.args if x in ['X', 'Y', 'Z']]
         self.arity = len(args)
         self.is_abstract = 'X' in args or 'Y' in args or 'Z' in args
+        self.is_very_abstract = not any(x in args for x in GROUND_VARS)
         self.address = None
+        self._val_function = None
         if add_to_cortex:
             cortex.add_function(self)
 
@@ -121,7 +219,7 @@ class Function(object):
     def from_str(string):
         string = string.replace(" ", "")
         func = re.compile(
-            "^(?P<name>[a-zA-Z]+)\((?P<arg0>[XYZabc])(?:,(?P<arg1>[XYZabc]))?\)$")
+            "^(?P<name>[a-zA-Z]+)\((?P<arg0>[XYZ" + GROUND_VARS + "])(?:,(?P<arg1>[XYZ" + GROUND_VARS + "]))?\)$")
         try:
             res = func.match(string).groupdict()
         except:
@@ -157,8 +255,8 @@ class Function(object):
 
     def substitute(self, from_, to, add_to_cortex=True):
         args = self.args[:]
-        if not (from_ in ['X', 'Y', 'Z'] and to in ['a', 'b', 'c']):
-            raise Exception("Substitionions must be XYZ -> abc")
+        if not (from_ in 'XYZ' and to in GROUND_VARS):
+            raise Exception("Substitionions must be XYZ -> " + GROUND_VARS)
         return Function(self.name, [a.replace(from_, to) for a in args],
                         add_to_cortex)
 
@@ -167,25 +265,33 @@ class Function(object):
             return [self]
         subs = []
         for from_ in self.free_args:
-            for to in ['a', 'b', 'c']:
+            for to in GROUND_VARS:
                 subs += self.substitute(from_, to, add_to_cortex).substitutions(add_to_cortex)
         return list(set(subs))
 
     @property
-    def val(self):
+    def val_(self):
         if self.address is None:
             raise Exception("Has no address.")
-        return cortex.state["".join(self.args)].output[self.address]
+        return cortex.state["".join(self.args)][self.address]
+
+    @property
+    def val(self):
+        if self._val_function is None:
+            self._val_function = net.function([], self.val_)
+        return self._val_function()
 
 
 class Cortex(object):
     def __init__(self):
-        fields = ["".join(x) for x in product('abc')] \
-                 + ["".join(x) for x in product('abc', repeat=2)]
+        fields = ["".join(x) for x in product(GROUND_VARS)] \
+                 + ["".join(x) for x in product(GROUND_VARS, repeat=2)]
         self.address_counters = dict(zip(fields, [self.Counter() for _ in range(len(fields))]))
         self.functions = {}
         self.names = []
         self.state = []
+        self.abstract_clauses = []
+        self.facts = {}
 
     def add_function(self, function):
         if function.name in self.names:
@@ -195,8 +301,48 @@ class Cortex(object):
         for f in function.abstract().substitutions(False):
             i = self.address_counters["".join(f.args)].next()
             self.functions[f] = i
+            self.facts[f] = (theano.shared(0), theano.shared(0))
             f.address = i
         self.names.append(function.name)
+
+    def get_function(self, name):
+        for f in self.functions.iterkeys():
+            if name == f:
+                return f
+        raise KeyError("Not found.")
+
+    def add_abstract_clause(self, clause):
+        if clause not in self.abstract_clauses:
+            self.abstract_clauses.append(clause)
+
+    def add_abstract_clause_collection(self, clause_collection):
+        if clause_collection not in self.abstract_clause_collections:
+            self.abstract_clause_collections.append(clause_collection)
+
+    def create_loss_functions(self):
+        ground_clauses = []
+        for abstract_clause in self.abstract_clauses:
+            ground_clauses += abstract_clause.substitutions()
+        loss = net.tensor.sum([- ground_clause.t_log_val for ground_clause in ground_clauses] +
+                              [-(tensor.log(k.t_val) * v +
+                                 tensor.log(1 - k.t_val) * (1 - v)) * active
+                               for (k, (v, active)) in self.facts.items()])
+
+        weight_updates = []
+        for w, b in set([(s.w, s.b) for s in self.net.sums]):
+            try:
+                dw, db = tensor.grad(loss, [w, b])
+                weight_updates += [(w, w - dw * .01), (b, b - db * .01)]
+            except DisconnectedInputError:
+                continue
+
+        thought_updates = []
+        for input in self.net.shared_inputs:
+            dx = tensor.grad(loss, input.x)
+            thought_updates += [(input.x, input.x - dx * .01)]
+
+        self.think = net.function([], loss, updates=thought_updates)
+        self.learn = net.function([], loss, updates=weight_updates)
 
     class Counter(object):
         def __init__(self):
@@ -210,18 +356,31 @@ class Cortex(object):
         def __len__(self):
             return self.c
 
+    def set_fact(self, statement, new_value=1):
+        value, active = self.facts[statement]
+        value.set_value(new_value)
+        active.set_value(1)
+
+    def remove_fact(self, statement):
+        self.facts[statement][1].set_value(0)
+
+    def print_facts(self):
+        for statement, (value, active) in self.facts.iteritems():
+            if theano.function([], active)():
+                print str(statement) + ": %.2f" % theano.function([], value)()
+
     def create_net(self):
         n_hidden_x = [10, 10]
         n_hidden_xy = [10, 10]
         l_in = 10
         l_out_x = len(self.address_counters['a'])
         l_out_xy = len(self.address_counters['aa'])
-        inputs = [{"name": 'in_' + name, "length": l_in}
-                  for name in ['a', 'b', 'c']]
+        inputs = [{"name": 'in_' + name, "length": l_in, "shared": True}
+                  for name in GROUND_VARS]
         outputs_x = [{"name": "".join(x), "length": l_out_x}
-                     for x in product('abc')]
+                     for x in product(GROUND_VARS)]
         outputs_xy = [{"name": "".join(x), "length": l_out_xy}
-                      for x in product('abc', repeat=2)]
+                      for x in product(GROUND_VARS, repeat=2)]
         outputs = outputs_x + outputs_xy
 
         in_layer_length = l_in
@@ -245,7 +404,7 @@ class Cortex(object):
                        "n_out": l_out_xy})
 
         nnet = {"name": "cortex", "sigsums": {}, "outputs": {}, "inputs": [i['name'] for i in inputs]}
-        for letter in 'abc':
+        for letter in GROUND_VARS:
             in_layer = "in_%s" % letter
             for i, layer_length in enumerate(n_hidden_x):
                 name = "hidden_%s_%i" % (letter, i)
@@ -253,7 +412,7 @@ class Cortex(object):
                 in_layer = name
             nnet["sigsums"]["hidden_%s_o" % letter] = {"in": [in_layer], "prototype": "hidden_x_o"}
             nnet["outputs"]["%s" % letter] = {"in": ["hidden_%s_o" % letter]}
-        for letters in product('abc', repeat=2):
+        for letters in product(GROUND_VARS, repeat=2):
             in_layer = ["hidden_%s_%i" % (letter, len(n_hidden_x) - 1) for letter in letters]
             for i, layer_length in enumerate(n_hidden_xy):
                 name = "hidden_%s%s_%i" % (letters + (i,))
@@ -264,7 +423,7 @@ class Cortex(object):
             nnet["outputs"]["%s%s" % letters] = {"in": ["hidden_%s%s_o" % letters]}
         self.d = net.Dings(inputs, outputs, hidden)
         self.net = self.d.create_net(nnet)
-        self.state = self.net.out_dict
+        self.state = dict([(o.name, o.output) for o in self.net.outputs])
         self.setup = {"outputs": outputs, "sigsums": hidden, "inputs": inputs, "network": nnet}
 
 

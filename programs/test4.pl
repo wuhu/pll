@@ -1,0 +1,5 @@
+left(a, b)
+left(b, c)
+above(d, c)
+above(e, d)
+left(d, a)

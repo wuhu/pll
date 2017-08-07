@@ -1,0 +1,5 @@
+plusone(five, four)
+plusone(six, five)
+plusone(seven, six)
+plusone(eight, seven)
+plusone(nine, eight)

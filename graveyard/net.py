@@ -22,16 +22,20 @@ class SquaredLoss(object):
 class Net(object):
     def __init__(self, name, inputs, outputs, sigsums, sigmoids, sums):
         self.name = name
-        self.inputs = inputs
+        self.inputs = [i for i in inputs if isinstance(i, Input)]
+        self.shared_inputs = [i for i in inputs if isinstance(i, SharedInput)]
         self.sigsums = sigsums
-        self.sigmoids = sigmoids
-        self.sums = sums
+        self.sigmoids = sigmoids + [sigsum.sigmoid_layer for sigsum in sigsums]
+        self.sums = sums + [sigsum.sum_layer for sigsum in sigsums]
         self.outputs = outputs
         self._compiled = None
         self.train = None
         self.in_indices = dict([(inp.name, i) for (i, inp) in enumerate(self.inputs)])
         self.out_indices = dict([(out.name, i) for (i, out) in enumerate(self.outputs)])
-        self.out_dict = dict([(out.name, out) for out in self.outputs])
+
+    def reset_shared_inputs(self):
+        for i in self.shared_inputs:
+            i.reset_value()
 
     @property
     def compiled(self):
@@ -49,9 +53,9 @@ class Net(object):
         loss_function = loss_function_class(len(self.outputs))
         updates = []
         for layer in self.sums:
-            dw, db = tensor.grad(loss_function.loss([o.output for o in self.outputs]), [layer.w, layer.b])
+            dw, db = tensor.grad(loss_function.t_loss([o.output for o in self.outputs]), [layer.w, layer.b])
             updates += [(layer.w, layer.w - dw * .01), (layer.b, layer.b - db * .01)]
-        self.train = function([self.inputs, loss_function.goal], loss_function, updates=updates)
+        self.train = function([self.inputs, loss_function.goals], loss_function, updates=updates)
 
     def __repr__(self):
         return self.name
@@ -181,6 +185,28 @@ class Input(Layer):
         return Input(name, self.n_in)
 
 
+class SharedInput(Layer):
+    def __init__(self, name, length, x=None):
+        if x is None:
+            self.x = theano.shared(np.random.randn(length), 'x:%s' % name)
+        else:
+            self.x = x
+        Layer.__init__(self, name, length, length)
+
+    def set_value(self, value):
+        self.x.set_value(value)
+
+    def reset_value(self):
+        self.set_value(np.random.randn(self.n_in))
+
+    @property
+    def output(self):
+        return self.x
+
+    def clone(self, name):
+        return SharedInput(name, self.n_in, self.x)
+
+
 class Output(Layer):
     def __init__(self, name, length):
         Layer.__init__(self, name, length, length)
@@ -207,7 +233,10 @@ class Dings(object):
     def __init__(self, inputs, outputs, sigsums=(), sigmoids=(), sums=(), vector_sums=()):
         self.inputs = {}
         for i in inputs:
-            self.inputs[i['name']] = Input(i['name'], i['length'])
+            if 'shared' in i and i['shared']:
+                self.inputs[i['name']] = SharedInput(i['name'], i['length'])
+            else:
+                self.inputs[i['name']] = Input(i['name'], i['length'])
         self.outputs = {}
         for o in outputs:
             self.outputs[o['name']] = Output(o['name'], o['length'])
@@ -260,7 +289,6 @@ class Dings(object):
         todo = (setup['sigmoids'].items() + setup['outputs'].items() + setup['sums'].items() +
                 setup['sigsums'].items())
         while todo:
-            print todo
             name, args = todo.pop(0)
             try:
                 i_s = []

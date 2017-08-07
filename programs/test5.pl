@@ -1,0 +1,5 @@
+cat(tom)
+cat(felix)
+animal(X) :- cat(X)
+cat(X) :- lion(X)
+-stone(X) :- animal(X)

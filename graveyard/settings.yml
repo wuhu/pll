@@ -1,0 +1,18 @@
+learn:
+  lr: 0.1
+  n: 100000
+  min_error: 0.01
+
+anti:
+  n_search: 10000
+  n_think_pre: 10
+  n_think_post: 10000
+  min_error: 1.
+  s_error: 1.
+  ignore_v: 1.
+
+architecture:
+  l_in: 10
+  n_hidden_x: [10, 10]
+  n_hidden_xy: [10]
+  n_anti: 10
